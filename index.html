@@ -1,0 +1,179 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>Tournoi Baby-Foot — fichier unique</title>
+<style>
+  body{font-family:system-ui,Arial;margin:14px;background:#f3f7fb;color:#0b1a2b}
+  .wrap{max-width:980px;margin:0 auto}
+  h1{text-align:center;color:#0b66c2}
+  .card{background:#fff;border-radius:8px;padding:14px;margin:12px 0;box-shadow:0 2px 8px rgba(0,0,0,0.06)}
+  .row{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:8px}
+  input,select,button{padding:8px;border-radius:6px;border:1px solid #cbd5e1}
+  button{cursor:pointer;background:#2563eb;color:white;border:none}
+  button.warn{background:#f59e0b;color:#111}
+  button.danger{background:#dc2626}
+  .muted{color:#64748b;font-size:13px}
+  .pill{display:inline-block;padding:6px 10px;border-radius:999px;background:#eef2ff;margin:4px;border:1px solid #c7d2fe}
+  .match{border:1px solid #e2e8f0;padding:10px;border-radius:6px;margin:8px 0;background:#ffffff}
+  .badge{display:inline-block;padding:4px 8px;border-radius:999px;background:#e6eef8;margin-right:8px;font-size:12px}
+  .help{font-size:13px;color:#475569}
+  pre{background:#f1f5f9;padding:8px;border-radius:6px;max-height:260px;overflow:auto}
+</style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>Tournoi Baby-Foot — Tout-en-un</h1>
+
+    <section class="card">
+      <h2>1) Inscriptions</h2>
+      <div class="row">
+        <input id="playerName" placeholder="Nom du joueur" />
+        <select id="playerRole"><option>Attaquant</option><option>Défenseur</option><option>Polyvalent</option></select>
+        <button id="btnAdd">Ajouter</button>
+        <button id="btnReset" class="danger">Réinitialiser tout</button>
+      </div>
+      <div id="playersList" class="muted">Aucun joueur</div>
+    </section>
+
+    <section class="card">
+      <h2>2) Qualifications — DYP (2 vs 2)</h2>
+      <div class="row">
+        <button id="btnNewRound">Nouvelle manche</button>
+        <span id="roundInfo" class="muted"></span>
+      </div>
+      <div id="qualifMatches"></div>
+      <h3>Classement</h3>
+      <div id="ranking"></div>
+      <h3>Historique Qualifications</h3>
+      <div id="qualifHistory" class="muted"></div>
+    </section>
+
+    <section class="card">
+      <h2>3) Phase finale — Double élimination (2 vs 2)</h2>
+      <div class="row">
+        <label>Nombre de qualifiés:<input id="finalCount" type="number" value="8" min="4" step="4" style="width:90px;margin-left:6px"></label>
+        <button id="btnStartFinals" style="background:#16a34a">Démarrer phase finale</button>
+        <button id="btnForceNext" style="background:#f59e0b">Forcer avancée</button>
+        <button id="btnExport" style="background:#10b981">Exporter historique</button>
+      </div>
+      <div class="help">Valide tous les matchs d'un round (WB ou LB) pour créer le round suivant automatiquement. Si bloqué -> Forcer avancée.</div>
+      <div id="finalsArea"></div>
+      <h3>Historique Phase Finale</h3>
+      <div id="finalsHistory" class="muted"></div>
+    </section>
+
+    <section class="card">
+      <h2>Debug (erreurs & état interne)</h2>
+      <div class="muted">Les erreurs JS apparaîtront ici si quelque chose plante.</div>
+      <pre id="debugFinals">--</pre>
+    </section>
+  </div>
+
+<script>
+// --- Global error catcher: affiche erreurs dans Debug Finals ---
+window.onerror = function(message, source, line, col, err){
+  const elDbg = document.getElementById('debugFinals');
+  if(elDbg) elDbg.textContent = `${message} — ${source}:${line}:${col}
+${err && err.stack ? err.stack : ''}`;
+  console.error(message, source, line, col, err);
+  return false;
+};
+
+// ---------- State ----------
+let players = [];
+let stats = {};
+let qualifRound = 0;
+let qualifMatches = [];
+let usedTeamPairs = {};
+let usedMatchups = {};
+let qualifHistory = [];
+let finals = null;
+let finalsHistory = [];
+
+// ---------- Helpers ----------
+const el = id => document.getElementById(id);
+const randId = ()=> Math.random().toString(36).slice(2,9);
+const shuffle = arr => arr.sort(()=>Math.random()-0.5);
+const pairKey = (A,B)=>{ const t1=A.slice().sort().join('&'); const t2=B.slice().sort().join('&'); return [t1,t2].sort().join('|'); };
+function ensurePlayer(n){ if(!stats[n]) stats[n] = {W:0,D:0,GF:0,GA:0,byeCount:0}; }
+
+// ---------- UI render ----------
+function renderPlayersList(){ el('playersList').innerHTML = players.length ? players.map(p=>`<span class="pill">${p.name} (${p.role})</span>`).join(' ') : '<span class="muted">Aucun joueur</span>'; }
+function renderRanking(){
+  const rows = Object.entries(stats).map(([name,s])=>({name, ...s}));
+  rows.sort((a,b)=>{ if(b.W!==a.W) return b.W-a.W; const gda=a.GF-a.GA, gdb=b.GF-b.GA; if(gdb!==gda) return gdb-gda; return b.GF-a.GF; });
+  let html = '<table style="width:100%;border-collapse:collapse"><tr><th>Rang</th><th>Joueur</th><th>V</th><th>D</th><th>GF</th><th>GA</th><th>GD</th></tr>';
+  rows.forEach((r,i)=> html+=`<tr><td style="padding:6px">${i+1}</td><td>${r.name}</td><td>${r.W||0}</td><td>${r.D||0}</td><td>${r.GF||0}</td><td>${r.GA||0}</td><td>${(r.GF||0)-(r.GA||0)}</td></tr>`);
+  html += '</table>'; el('ranking').innerHTML = html;
+}
+
+function renderQualifMatches(){
+  const node = el('qualifMatches'); node.innerHTML='';
+  const current = qualifMatches.filter(m=>m.round===qualifRound);
+  if(!current.length){ node.innerHTML='<div class="muted">Aucun match généré pour cette manche.</div>'; return; }
+  current.forEach((m,i)=>{
+    const id = m.id;
+    const d = document.createElement('div'); d.className='match';
+    d.innerHTML = `<div><span class="badge">Qualif</span> <b>Match ${m.round}.${i+1}</b></div>
+      <div>${m.teamA.join(' & ')} <b>vs</b> ${m.teamB.join(' & ')}</div>
+      <div class="row"><input id="A_${id}" type="number" min="0" placeholder="0"> - <input id="B_${id}" type="number" min="0" placeholder="0">
+      <button data-id="${id}">Valider</button></div>`;
+    d.querySelector('button').onclick = ()=> submitQualif(id);
+    node.appendChild(d);
+  });
+}
+function renderQualifHistory(){ el('qualifHistory').innerHTML = qualifHistory.length ? '<ol>'+qualifHistory.map(s=>`<li>${s.replace(/\|/g,' vs ')}</li>`).join('')+'</ol>' : '<div class="muted">Aucun match.</div>'; }
+
+function renderFinals(){
+  const node = el('finalsArea'); node.innerHTML='';
+  if(!finals){ node.innerHTML = '<div class="muted">Phase finale non initialisée</div>'; el('debugFinals').textContent = 'finals not initialized'; return; }
+  // WB
+  finals.WB.rounds.forEach((rnd,ri)=>{
+    const r = ri+1;
+    rnd.forEach((m,mi)=>{
+      const uid = `W${r}_${m.id}`;
+      const div = document.createElement('div'); div.className='match';
+      div.innerHTML = `<div><span class="badge">[WB R${r} - Match ${mi+1}]</span> ${m.teamA.join(' & ')} vs ${m.teamB.join(' & ')}</div>`;
+      const actions = document.createElement('div'); actions.className='row';
+      if(!m.done){
+        actions.innerHTML = `<input id="A_${uid}" type="number" min="0" placeholder="0"> - <input id="B_${uid}" type="number" min="0" placeholder="0"> <button>Valider</button>`;
+        actions.querySelector('button').onclick = ()=> submitFinal(uid);
+      } else actions.innerHTML = `<div class="muted">Score: ${m.scoreA} - ${m.scoreB}</div>`;
+      div.appendChild(actions); node.appendChild(div);
+    });
+  });
+  // LB
+  finals.LB.rounds.forEach((rnd,ri)=>{
+    const r = ri+1;
+    rnd.forEach((m,mi)=>{
+      const uid = `L${r}_${m.id}`;
+      const div = document.createElement('div'); div.className='match';
+      div.innerHTML = `<div><span class="badge">[LB R${r} - Match ${mi+1}]</span> ${m.teamA.join(' & ')} vs ${m.teamB.join(' & ')}</div>`;
+      const actions = document.createElement('div'); actions.className='row';
+      if(!m.done){
+        actions.innerHTML = `<input id="A_${uid}" type="number" min="0" placeholder="0"> - <input id="B_${uid}" type="number" min="0" placeholder="0"> <button style="background:#f59e0b">Valider</button>`;
+        actions.querySelector('button').onclick = ()=> submitFinal(uid);
+      } else actions.innerHTML = `<div class="muted">Score: ${m.scoreA} - ${m.scoreB}</div>`;
+      div.appendChild(actions); node.appendChild(div);
+    });
+  });
+  // GF
+  finals.GF.forEach((m,idx)=>{
+    const uid = `F${idx}_${m.id}`;
+    const div = document.createElement('div'); div.className='match';
+    div.innerHTML = `<div><span class="badge">[GF - Match ${idx+1}]</span> ${m.teamA.join(' & ')} vs ${m.teamB.join(' & ')}</div>`;
+    const actions = document.createElement('div'); actions.className='row';
+    if(!m.done){
+      actions.innerHTML = `<input id="A_${uid}" type="number" min="0" placeholder="0"> - <input id="B_${uid}" type="number" min="0" placeholder="0"> <button>Valider</button>`;
+      actions.querySelector('button').onclick = ()=> submitFinal(uid);
+    } else actions.innerHTML = `<div class="muted">Score: ${m.scoreA} - ${m.scoreB}</div>`;
+    div.appendChild(actions); node.appendChild(div);
+  });
+  el('debugFinals').textContent = JSON.stringify(finals, null, 2);
+}
+function renderFinalsHistory(){ el('finalsHistory').innerHTML = finalsHistory.length ? '<ol>'+finalsHistory.map(s=>`<li>${s.replace(/\|/g,' vs ')}</li>`).join('')+'</ol>' : '<div class="muted">Aucun match.</div>'; }
+
+// ---------- QUALIFS logic ----------
+def_inc = None
