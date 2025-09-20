@@ -1,0 +1,452 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>Tournoi Baby-Foot — debug final</title>
+<style>
+  body{font-family:system-ui,Arial;margin:14px;background:#f3f7fb;color:#0b1a2b}
+  .wrap{max-width:980px;margin:0 auto}
+  h1{text-align:center;color:#0b66c2}
+  .card{background:#fff;border-radius:8px;padding:14px;margin:12px 0;box-shadow:0 2px 8px rgba(0,0,0,0.06)}
+  .row{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:8px}
+  input,select,button{padding:8px;border-radius:6px;border:1px solid #cbd5e1}
+  button{cursor:pointer;background:#2563eb;color:white;border:none}
+  button.warn{background:#f59e0b;color:#111}
+  button.danger{background:#dc2626}
+  .muted{color:#64748b;font-size:13px}
+  .pill{display:inline-block;padding:6px 10px;border-radius:999px;background:#eef2ff;margin:4px;border:1px solid #c7d2fe}
+  .match{border:1px solid #e2e8f0;padding:10px;border-radius:6px;margin:8px 0;background:#ffffff}
+  .badge{display:inline-block;padding:4px 8px;border-radius:999px;background:#e6eef8;margin-right:8px;font-size:12px}
+  pre{background:#f1f5f9;padding:8px;border-radius:6px;max-height:260px;overflow:auto}
+</style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>Tournoi Baby-Foot — Qualifs & Finale 2v2 (debug)</h1>
+
+    <section class="card">
+      <h2>1) Inscriptions</h2>
+      <div class="row">
+        <input id="playerName" placeholder="Nom du joueur" />
+        <select id="playerRole"><option>Attaquant</option><option>Défenseur</option><option>Polyvalent</option></select>
+        <button id="btnAdd">Ajouter</button>
+        <button id="btnReset" class="danger">Réinitialiser tout</button>
+      </div>
+      <div id="playersList" class="muted"></div>
+    </section>
+
+    <section class="card">
+      <h2>2) Qualifications — DYP (2 vs 2)</h2>
+      <div class="row">
+        <button id="btnNewRound">Nouvelle manche</button>
+        <span id="roundInfo" class="muted"></span>
+      </div>
+      <div id="qualifMatches"></div>
+      <h3>Classement</h3>
+      <div id="ranking"></div>
+      <h3>Historique Qualifications</h3>
+      <div id="qualifHistory" class="muted"></div>
+    </section>
+
+    <section class="card">
+      <h2>3) Phase finale — Double élimination (2 vs 2)</h2>
+      <div class="row">
+        <label>Nombre de qualifiés:<input id="finalCount" type="number" value="8" min="4" step="4" style="width:90px;margin-left:6px"></label>
+        <button id="btnStartFinals" style="background:#16a34a">Démarrer phase finale</button>
+        <button id="btnForceNext" style="background:#f59e0b">Forcer avancée</button>
+      </div>
+      <div class="help">Valide tous les matchs d'un round (WB ou LB) pour créer le round suivant automatiquement. Si bloqué, cliquez "Forcer avancée".</div>
+      <div id="finalsArea"></div>
+      <h3>Historique Phase Finale</h3>
+      <div id="finalsHistory" class="muted"></div>
+    </section>
+
+    <section class="card">
+      <h2>Debug Finals (état interne)</h2>
+      <div class="muted">Copie de l'objet internal <code>finals</code> — utile pour debug.</div>
+      <pre id="debugFinals">finals not initialized</pre>
+    </section>
+  </div>
+
+<script>
+/* ---------- State ---------- */
+let players = [];               // {name, role}
+let stats = {};                 // name -> {W,D,GF,GA,byeCount}
+let qualifRound = 0;
+let qualifMatches = [];         // {id,round,teamA[],teamB[],scoreA,scoreB,done}
+let usedTeamPairs = {};         // avoid repeating pairs
+let usedMatchups = {};         // avoid repeating matchups
+let qualifHistory = [];        // strings
+let finals = null;              // finals structure
+let finalsHistory = [];         // strings
+
+/* ---------- Helpers ---------- */
+const el = id => document.getElementById(id);
+const randId = ()=> Math.random().toString(36).slice(2,9);
+const shuffle = arr => arr.sort(()=>Math.random()-0.5);
+const pairKey = (A,B) => { const t1=A.slice().sort().join('&'); const t2=B.slice().sort().join('&'); return [t1,t2].sort().join('|'); };
+function ensurePlayer(n){ if(!stats[n]) stats[n] = {W:0,D:0,GF:0,GA:0,byeCount:0}; }
+
+/* ---------- Render functions ---------- */
+function renderPlayersList(){ el('playersList').innerHTML = players.length ? players.map(p=>`<span class="pill">${p.name} (${p.role})</span>`).join(' ') : '<span class="muted">Aucun joueur</span>'; }
+function renderRanking(){
+  const rows = Object.entries(stats).map(([name,s])=>({name,...s}));
+  rows.sort((a,b)=>{ if(b.W!==a.W) return b.W-a.W; const gda=a.GF-a.GA, gdb=b.GF-b.GA; if(gdb!==gda) return gdb-gda; return b.GF-a.GF; });
+  let html = '<table style="width:100%;border-collapse:collapse"><tr><th>Rang</th><th>Joueur</th><th>V</th><th>D</th><th>GF</th><th>GA</th><th>GD</th></tr>';
+  rows.forEach((r,i)=> html+=`<tr><td style="padding:6px">${i+1}</td><td>${r.name}</td><td>${r.W||0}</td><td>${r.D||0}</td><td>${r.GF||0}</td><td>${r.GA||0}</td><td>${(r.GF||0)-(r.GA||0)}</td></tr>`);
+  html+='</table>'; el('ranking').innerHTML = html;
+}
+
+function renderQualifMatches(){
+  const node = el('qualifMatches'); node.innerHTML='';
+  const current = qualifMatches.filter(m=>m.round===qualifRound);
+  if(!current.length){ node.innerHTML='<div class="muted">Aucun match généré pour cette manche.</div>'; return;}
+  current.forEach((m,i)=>{
+    const id = m.id;
+    const d = document.createElement('div'); d.className='match';
+    d.innerHTML = `<div><span class="badge">Qualif</span> <b>Match ${m.round}.${i+1}</b></div>
+      <div>${m.teamA.join(' & ')} <b>vs</b> ${m.teamB.join(' & ')}</div>
+      <div class="row"><input id="A_${id}" type="number" min="0" placeholder="0"> - <input id="B_${id}" type="number" min="0" placeholder="0">
+      <button onclick="submitQualif('${id}')">Valider</button></div>`;
+    node.appendChild(d);
+  });
+}
+function renderQualifHistory(){ el('qualifHistory').innerHTML = qualifHistory.length ? '<ol>'+qualifHistory.map(s=>`<li>${s.replace(/\|/g,' vs ')}</li>`).join('')+'</ol>' : '<div class="muted">Aucun match.</div>'; }
+
+function renderFinals(){
+  const node = el('finalsArea'); node.innerHTML = '';
+  if(!finals){ node.innerHTML = '<div class="muted">Phase finale non initialisée</div>'; el('debugFinals').textContent = 'finals not initialized'; return; }
+  // WB
+  finals.WB.rounds.forEach((rnd,ri)=>{
+    const r = ri+1;
+    rnd.forEach((m,mi)=>{
+      const uid = `W${r}_${m.id}`;
+      const div = document.createElement('div'); div.className='match';
+      div.innerHTML = `<div><span class="badge">[WB R${r} - Match ${mi+1}]</span> ${m.teamA.join(' & ')} vs ${m.teamB.join(' & ')}</div>`;
+      const actions = document.createElement('div'); actions.className='row';
+      if(!m.done){
+        actions.innerHTML = `<input id="A_${uid}" type="number" min="0" placeholder="0"> - <input id="B_${uid}" type="number" min="0" placeholder="0"> <button>Valider</button>`;
+        actions.querySelector('button').onclick = ()=> submitFinal(uid);
+      } else actions.innerHTML = `<div class="muted">Score: ${m.scoreA} - ${m.scoreB}</div>`;
+      div.appendChild(actions); node.appendChild(div);
+    });
+  });
+  // LB
+  finals.LB.rounds.forEach((rnd,ri)=>{
+    const r = ri+1;
+    rnd.forEach((m,mi)=>{
+      const uid = `L${r}_${m.id}`;
+      const div = document.createElement('div'); div.className='match';
+      div.innerHTML = `<div><span class="badge">[LB R${r} - Match ${mi+1}]</span> ${m.teamA.join(' & ')} vs ${m.teamB.join(' & ')}</div>`;
+      const actions = document.createElement('div'); actions.className='row';
+      if(!m.done){
+        actions.innerHTML = `<input id="A_${uid}" type="number" min="0" placeholder="0"> - <input id="B_${uid}" type="number" min="0" placeholder="0"> <button style="background:#f59e0b">Valider</button>`;
+        actions.querySelector('button').onclick = ()=> submitFinal(uid);
+      } else actions.innerHTML = `<div class="muted">Score: ${m.scoreA} - ${m.scoreB}</div>`;
+      div.appendChild(actions); node.appendChild(div);
+    });
+  });
+  // GF
+  finals.GF.forEach((m,idx)=>{
+    const uid = `F${idx}_${m.id}`;
+    const div = document.createElement('div'); div.className='match';
+    div.innerHTML = `<div><span class="badge">[GF - Match ${idx+1}]</span> ${m.teamA.join(' & ')} vs ${m.teamB.join(' & ')}</div>`;
+    const actions = document.createElement('div'); actions.className='row';
+    if(!m.done){
+      actions.innerHTML = `<input id="A_${uid}" type="number" min="0" placeholder="0"> - <input id="B_${uid}" type="number" min="0" placeholder="0"> <button>Valider</button>`;
+      actions.querySelector('button').onclick = ()=> submitFinal(uid);
+    } else actions.innerHTML = `<div class="muted">Score: ${m.scoreA} - ${m.scoreB}</div>`;
+    div.appendChild(actions); node.appendChild(div);
+  });
+
+  el('debugFinals').textContent = JSON.stringify(finals, null, 2);
+}
+function renderFinalsHistory(){ el('finalsHistory').innerHTML = finalsHistory.length ? '<ol>'+finalsHistory.map(s=>`<li>${s.replace(/\|/g,' vs ')}</li>`).join('')+'</ol>' : '<div class="muted">Aucun match.</div>'; }
+
+/* ---------- QUALIFS logic ---------- */
+function incMatchup(teamA,teamB){ const k = teamA.slice().sort().join('&') + '|' + teamB.slice().sort().join('&'); usedMatchups[k]=(usedMatchups[k]||0)+1; }
+function incTeamPair(a,b){ const k = [a,b].slice().sort().join('&'); usedTeamPairs[k]=(usedTeamPairs[k]||0)+1; }
+
+function buildTeams(){
+  const attackers = players.filter(p=>p.role==='Attaquant' || p.role==='Polyvalent').map(p=>p.name);
+  const defenders = players.filter(p=>p.role==='Défenseur' || p.role==='Polyvalent').map(p=>p.name);
+  let candidates=[];
+  attackers.forEach(a=> defenders.forEach(d=>{ if(a!==d) candidates.push({a,d,used: usedTeamPairs[[a,d].sort().join('&')]||0}); }));
+  shuffle(candidates); candidates.sort((x,y)=> x.used - y.used);
+  const used = new Set(); const teams = [];
+  candidates.forEach(c=>{ if(used.has(c.a) || used.has(c.d)) return; teams.push([c.a,c.d]); used.add(c.a); used.add(c.d); });
+  const leftovers = players.map(p=>p.name).filter(n=>!used.has(n));
+  while(leftovers.length>=2) teams.push([leftovers.pop(), leftovers.pop()]);
+  return teams;
+}
+function chooseBye(teams){
+  if(!teams.length) return null;
+  let best=Infinity, idx=0;
+  teams.forEach((t,i)=>{ const s=(stats[t[0]].byeCount||0)+(stats[t[1]].byeCount||0); if(s<best){best=s; idx=i;} });
+  return teams.splice(idx,1)[0];
+}
+function pairTeamsMinRepeats(teams){
+  let best=null, bestScore=Infinity;
+  for(let k=0;k<80;k++){
+    const arr = teams.slice(); shuffle(arr);
+    let score=0, pairs=[];
+    for(let i=0;i<arr.length;i+=2){
+      const A=arr[i], B=arr[i+1];
+      const key = A.slice().sort().join('&') + '|' + B.slice().sort().join('&');
+      score += (usedMatchups[key]||0);
+      pairs.push([A,B]);
+    }
+    if(score < bestScore){ bestScore=score; best=pairs; if(score===0) break;}
+  }
+  return best;
+}
+
+function generateQualifRound(){
+  if(players.length < 4) return alert('Au moins 4 joueurs requis');
+  qualifRound++;
+  el('roundInfo').textContent = 'Manche ' + qualifRound;
+  const teams = buildTeams(); let copy = teams.slice();
+  if(copy.length % 2 === 1){
+    const bye = chooseBye(copy);
+    stats[bye[0]].W++; stats[bye[1]].W++;
+    stats[bye[0]].byeCount++; stats[bye[1]].byeCount++;
+    qualifHistory.push(`${bye[0]} & ${bye[1]}|BYE`);
+  }
+  const pairs = pairTeamsMinRepeats(copy);
+  pairs.forEach(pair=>{
+    const [tA,tB]=pair;
+    incTeamPair(tA[0], tA[1]); incTeamPair(tB[0], tB[1]);
+    const id = 'Q'+randId();
+    qualifMatches.push({id, round:qualifRound, teamA:tA, teamB:tB, scoreA:null, scoreB:null, done:false});
+  });
+  renderQualifMatches(); renderRanking(); renderQualifHistory();
+}
+function submitQualif(id){
+  const m = qualifMatches.find(x=>x.id===id); if(!m || m.done) return;
+  const a = parseInt(el('A_'+id).value||'0',10), b = parseInt(el('B_'+id).value||'0',10);
+  if(a<11 && b<11) return alert('Un score doit atteindre 11');
+  m.scoreA=a; m.scoreB=b; m.done=true;
+  const winner = a>b ? m.teamA : m.teamB;
+  const loser = a>b ? m.teamB : m.teamA;
+  winner.forEach(n=>{ ensurePlayer(n); stats[n].W++; stats[n].GF += Math.max(a,b); stats[n].GA += Math.min(a,b); });
+  loser.forEach(n=>{ ensurePlayer(n); stats[n].D++; stats[n].GF += Math.min(a,b); stats[n].GA += Math.max(a,b); });
+  incMatchup(m.teamA, m.teamB);
+  qualifHistory.push(pairKey(m.teamA, m.teamB));
+  renderQualifMatches(); renderRanking(); renderQualifHistory();
+}
+
+/* ---------- FINALS logic (robuste) ---------- */
+function startFinals(){
+  const N = parseInt(el('finalCount').value,10);
+  const ranked = Object.entries(stats).map(([name,s])=>({name, ...s})).sort((a,b)=>{ if(b.W!==a.W) return b.W-a.W; const gda=a.GF-a.GA, gdb=b.GF-b.GA; if(gdb!==gda) return gdb-gda; return b.GF-a.GF; });
+  if(ranked.length < 4) return alert('Pas assez de joueurs qualifs');
+  let selected = ranked.slice(0,N).map(r=>r.name);
+  if(selected.length % 2 !== 0) selected.pop();
+  const sh = shuffle(selected.slice());
+  const teams = [];
+  for(let i=0;i<sh.length;i+=2) teams.push([sh[i], sh[i+1]]);
+  const teamCount = teams.length;
+  if((teamCount & (teamCount-1)) !== 0) return alert('Le nombre d\\'équipes doit être une puissance de 2 (4,8,16...)');
+  finals = { WB:{rounds:[]}, LB:{rounds:[]}, GF:[], _meta:{} };
+  finals.WB.rounds.push( teamsToMatches(teams, 1, 'W') );
+  renderFinals(); renderFinalsHistory();
+  alert('Phase finale initialisée — validez tous les matchs WB R1 pour avancer');
+}
+
+function teamsToMatches(teamsArray, roundNum, type){
+  const arr = [];
+  for(let i=0;i<teamsArray.length;i+=2){
+    const A=teamsArray[i], B=teamsArray[i+1];
+    // try to avoid repeats by swapping if necessary
+    const key = pairKey(A,B);
+    if(finalsHistory.includes(key) && i+2 < teamsArray.length){
+      const C = teamsArray[i+2]; teamsArray[i+1] = C; teamsArray[i+2] = B;
+    }
+    arr.push({ id: randId(), type, round: roundNum, teamA:A, teamB:B, scoreA:null, scoreB:null, done:false });
+  }
+  return arr;
+}
+
+function findFinalMatch(uid){
+  if(!finals) return null;
+  if(uid.startsWith('W')){
+    const parts = uid.split('_'); const r = parseInt(parts[0].slice(1),10)-1; const id = parts[1];
+    const arr = finals.WB.rounds[r] || []; return {match: arr.find(m=>m.id===id), bracket:'W', r};
+  }
+  if(uid.startsWith('L')){
+    const parts = uid.split('_'); const r = parseInt(parts[0].slice(1),10)-1; const id = parts[1];
+    const arr = finals.LB.rounds[r] || []; return {match: arr.find(m=>m.id===id), bracket:'L', r};
+  }
+  if(uid.startsWith('F')){
+    const parts = uid.split('_'); const idx = parseInt(parts[0].slice(1),10);
+    return {match: finals.GF[idx], bracket:'F', r:idx};
+  }
+  return null;
+}
+
+function submitFinal(uid){
+  const meta = findFinalMatch(uid);
+  if(!meta || !meta.match) return alert('Match introuvable');
+  const m = meta.match; if(m.done) return;
+  const a = parseInt(el('A_'+uid).value||'0',10), b = parseInt(el('B_'+uid).value||'0',10);
+  if(a<11 && b<11) return alert('Un score doit atteindre 11');
+  m.scoreA=a; m.scoreB=b; m.done=true;
+  const winnerTeam = a>b ? m.teamA.slice() : m.teamB.slice();
+  const loserTeam  = a>b ? m.teamB.slice() : m.teamA.slice();
+  finalsHistory.push(pairKey(m.teamA, m.teamB));
+  incMatchup(m.teamA, m.teamB);
+
+  // WB handling
+  if(meta.bracket==='W'){
+    finals._pendingWB = finals._pendingWB || {};
+    finals._pendingLB_fromWB = finals._pendingLB_fromWB || {};
+    finals._pendingWB[meta.r] = finals._pendingWB[meta.r] || [];
+    finals._pendingLB_fromWB[meta.r] = finals._pendingLB_fromWB[meta.r] || [];
+    finals._pendingWB[meta.r].push(winnerTeam);
+    finals._pendingLB_fromWB[meta.r].push(loserTeam);
+
+    const allDone = finals.WB.rounds[meta.r].every(x=>x.done);
+    if(allDone) handleWBRoundComplete(meta.r);
+  }
+
+  // LB handling
+  if(meta.bracket==='L'){
+    finals._pendingLBWin = finals._pendingLBWin || {};
+    finals._pendingLBWin[meta.r] = finals._pendingLBWin[meta.r] || [];
+    finals._pendingLBWin[meta.r].push(winnerTeam);
+    const arr = finals.LB.rounds[meta.r] || [];
+    const allDone = arr.length>0 && arr.every(x=>x.done);
+    if(allDone) handleLBRoundComplete(meta.r);
+  }
+
+  // GF handling
+  if(meta.bracket==='F'){
+    const idx = meta.r;
+    if(idx===0){
+      const lbWon = winnerTeam.join(',') === m.teamB.join(',');
+      if(lbWon){
+        finals.GF.push({ id: randId(), type:'F', round:2, teamA:m.teamB, teamB:m.teamA, scoreA:null, scoreB:null, done:false });
+        alert('LB a gagné la première finale — une seconde finale est ajoutée.');
+      } else alert('Vainqueur du tournoi : ' + winnerTeam.join(' & '));
+    } else alert('Vainqueur du tournoi : ' + winnerTeam.join(' & '));
+  }
+
+  // try to create GF if possible
+  maybeCreateGrandFinal();
+  renderFinals();
+  renderFinalsHistory();
+}
+
+/* handle WB complete -> recombine winners and push losers to LB R1 */
+function handleWBRoundComplete(roundIdx){
+  const winners = finals._pendingWB[roundIdx] ? finals._pendingWB[roundIdx].slice() : [];
+  finals._pendingWB[roundIdx] = [];
+  const nextTeams = [];
+  for(let i=0;i<winners.length;i+=2){
+    const t1=winners[i], t2=winners[i+1];
+    if(!t1||!t2) continue;
+    nextTeams.push([t1[0], t2[0]]);
+    nextTeams.push([t1[1], t2[1]]);
+  }
+  if(nextTeams.length){
+    finals.WB.rounds[roundIdx+1] = finals.WB.rounds[roundIdx+1] || [];
+    finals.WB.rounds[roundIdx+1] = finals.WB.rounds[roundIdx+1].concat( teamsToMatches(nextTeams, roundIdx+2, 'W') );
+  }
+  // losers -> LB round 1 append
+  const losers = finals._pendingLB_fromWB[roundIdx] ? finals._pendingLB_fromWB[roundIdx].slice() : [];
+  finals._pendingLB_fromWB[roundIdx] = [];
+  if(losers.length){
+    finals.LB.rounds[0] = finals.LB.rounds[0] || [];
+    for(let i=0;i<losers.length;i+=2){
+      const aT = losers[i], bT = losers[i+1];
+      if(aT && bT) finals.LB.rounds[0].push({ id: randId(), type:'L', round:1, teamA:aT, teamB:bT, scoreA:null, scoreB:null, done:false });
+    }
+  }
+}
+
+/* handle LB complete -> recombine winners into next LB round */
+function handleLBRoundComplete(roundIdx){
+  const wins = finals._pendingLBWin[roundIdx] ? finals._pendingLBWin[roundIdx].slice() : [];
+  finals._pendingLBWin[roundIdx] = [];
+  const nextTeams = [];
+  for(let i=0;i<wins.length;i+=2){
+    const t1=wins[i], t2=wins[i+1];
+    if(!t1||!t2) continue;
+    nextTeams.push([t1[0], t2[0]]);
+    nextTeams.push([t1[1], t2[1]]);
+  }
+  if(nextTeams.length){
+    finals.LB.rounds[roundIdx+1] = finals.LB.rounds[roundIdx+1] || [];
+    finals.LB.rounds[roundIdx+1] = finals.LB.rounds[roundIdx+1].concat( teamsToMatches(nextTeams, roundIdx+2, 'L') );
+  }
+}
+
+/* create GF when both champions ready */
+function maybeCreateGrandFinal(){
+  if(!finals) return;
+  let wbChampion=null;
+  for(let r=finals.WB.rounds.length-1;r>=0;r--){
+    const rnd = finals.WB.rounds[r]||[];
+    if(rnd.length===1 && rnd[0].done){ wbChampion = rnd[0].scoreA>rnd[0].scoreB ? rnd[0].teamA : rnd[0].teamB; break; }
+  }
+  let lbChampion=null;
+  for(let r=finals.LB.rounds.length-1;r>=0;r--){
+    const rnd = finals.LB.rounds[r]||[];
+    if(rnd.length===1 && rnd[0].done){ lbChampion = rnd[0].scoreA>rnd[0].scoreB ? rnd[0].teamA : rnd[0].teamB; break; }
+  }
+  if(wbChampion && lbChampion && (!finals.GF || finals.GF.length===0)){
+    finals.GF = [{ id: randId(), type:'F', round:1, teamA:wbChampion, teamB:lbChampion, scoreA:null, scoreB:null, done:false }];
+  }
+}
+
+/* Force advance: check all WB/LB rounds and run completion handlers if their matches are all done */
+function forceAdvance(){
+  if(!finals) return alert('Phase finale non initialisée');
+  // iterate WB rounds and LB rounds to run handlers when complete
+  for(let r=0;r< (finals.WB.rounds.length); r++){
+    const arr = finals.WB.rounds[r] || [];
+    if(arr.length>0 && arr.every(x=>x.done)) handleWBRoundComplete(r);
+  }
+  for(let r=0;r< (finals.LB.rounds.length); r++){
+    const arr = finals.LB.rounds[r] || [];
+    if(arr.length>0 && arr.every(x=>x.done)) handleLBRoundComplete(r);
+  }
+  maybeCreateGrandFinal();
+  renderFinals();
+  renderFinalsHistory();
+}
+
+/* ---------- Utility / history rendering ---------- */
+function renderFinalsHistory(){ el('finalsHistory').innerHTML = finalsHistory.length ? '<ol>'+finalsHistory.map(s=>`<li>${s.replace(/\|/g,' vs ')}</li>`).join('')+'</ol>' : '<div class="muted">Aucun match.</div>'; }
+
+/* ---------- Init / bindings ---------- */
+document.addEventListener('DOMContentLoaded', ()=>{
+  el('btnAdd').onclick = ()=>{
+    const name = el('playerName').value.trim();
+    const role = el('playerRole').value;
+    if(!name) return alert('Nom requis');
+    if(players.some(p=>p.name.toLowerCase()===name.toLowerCase())) return alert('Nom déjà inscrit');
+    players.push({name, role});
+    ensurePlayer(name);
+    el('playerName').value='';
+    renderPlayersList(); renderRanking();
+  };
+  el('btnReset').onclick = ()=>{
+    if(!confirm('Réinitialiser tout ?')) return;
+    players=[]; stats={}; qualifRound=0; qualifMatches=[]; usedTeamPairs={}; usedMatchups={};
+    qualifHistory=[]; finals=null; finalsHistory=[];
+    renderPlayersList(); renderQualifMatches(); renderRanking(); renderFinals(); renderQualifHistory(); renderFinalsHistory();
+    el('roundInfo').textContent='';
+    el('debugFinals').textContent='finals not initialized';
+  };
+  el('btnNewRound').onclick = generateQualifRound;
+  el('btnStartFinals').onclick = startFinals;
+  el('btnForceNext').onclick = forceAdvance;
+
+  // initial renders
+  renderPlayersList(); renderQualifMatches(); renderRanking(); renderFinals(); renderQualifHistory(); renderFinalsHistory();
+});
+</script>
+</body>
+</html>
